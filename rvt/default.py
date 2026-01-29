@@ -36,6 +36,9 @@ import datetime
 import time
 
 
+gdal.UseExceptions()
+
+
 class RVTVisualization(Enum):
     SLOPE = "slp"
     HILLSHADE = "hs"

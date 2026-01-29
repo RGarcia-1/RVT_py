@@ -19,19 +19,28 @@ Copyright:
 """
 
 # python libraries
+from typing import Callable
+
+import numexpr as ne
 import numpy as np
+import numpy.typing as npt
 from scipy.interpolate import griddata, RectBivariateSpline
 from scipy.ndimage.morphology import distance_transform_edt
 from scipy.spatial import cKDTree
 
 
-def byte_scale(data,
-               c_min=None,
-               c_max=None,
-               high=255,
-               low=0,
-               no_data=None
-               ):
+type FloatArray = npt.NDArray[np.floating]
+type UInt8Array = npt.NDArray[np.uint8]
+
+
+def byte_scale(
+    data: FloatArray,
+    c_min: float | None = None,
+    c_max: float | None = None,
+    high: int = 255,
+    low: int = 0,
+    no_data: float | None = None,
+) -> UInt8Array:
     """
     Remade old scipy function.
     Byte scales an array (image). Linear scale.
@@ -41,22 +50,22 @@ def byte_scale(data,
 
     Parameters
     ----------
-    data : numpy.ndarray
+    data : FloatArray
         Input data (visualization) as 2D or multi-D numpy array.
-    c_min : int or float
+    c_min : float | None
         Scalar, Bias scaling of small values. Default is ``data.min()``.
-    c_max : int or float
+    c_max : float | None
         Scalar, Bias scaling of large values. Default is ``data.max()``.
     high : int
         Scalar, Scale max value to `high`.  Default is 255.
     low : int
         Scalar, Scale min value to `low`.  Default is 0.
-    no_data : int or float
+    no_data : float | None
         Value that represents no_data, it is changed to np.nan .
 
     Returns
     -------
-    img_array : uint8 numpy.ndarray
+    img_array : UInt8Array
         The byte-scaled array.
     """
     is_2d_arr = False
@@ -92,20 +101,28 @@ def byte_scale(data,
 
         if data.dtype == np.uint8:
             # TODO: the following line seems not good to  me - if cmin=0, then that pixel will get negative value
-            byte_data = (high + 1) * (data - c_min - 1) / (c_max - c_min)  # copied from IDL BYTSCL
+            byte_data = (
+                (high + 1) * (data - c_min - 1) / (c_max - c_min)
+            )  # copied from IDL BYTSCL
             byte_data[byte_data > high] = high
             byte_data[byte_data < 0] = 0
             byte_data[np.isnan(byte_data)] = 0  # change no_data to 0
-            return np.asarray(byte_data, dtype=np.uint8) + np.asarray(low, dtype=np.uint8)
+            return np.asarray(byte_data, dtype=np.uint8) + np.asarray(
+                low, dtype=np.uint8
+            )
 
         # scale = float(high - low) / cscale  # old scipy fn
         # byte_data = (data * 1.0 - cmin) * scale + 0.4999  # old scipy fn
 
-        byte_data = (high + 0.9999) * (data - c_min) / (c_max - c_min)  # copied from IDL BYTSCL
+        byte_data = (
+            (high + 0.9999) * (data - c_min) / (c_max - c_min)
+        )  # copied from IDL BYTSCL
         byte_data[byte_data > high] = high
         byte_data[byte_data < 0] = 0
         byte_data[np.isnan(byte_data)] = 255  # change no_data to 255
-        byte_data = np.asarray(byte_data, dtype=np.uint8) + np.asarray(low, dtype=np.uint8)
+        byte_data = np.asarray(byte_data, dtype=np.uint8) + np.asarray(
+            low, dtype=np.uint8
+        )
         byte_data_bands.append(byte_data)
 
     if is_2d_arr:  # if only one band
@@ -114,18 +131,78 @@ def byte_scale(data,
         return np.array(byte_data_bands)
 
 
-def slope_aspect(dem,
-                 resolution_x=1,
-                 resolution_y=1,
-                 output_units="radian",
-                 ve_factor=1,
-                 no_data=None
-                 ):
+def slope_percent(dzdx: FloatArray, dzdy: FloatArray) -> FloatArray:
+    """Compute Slope (percent)"""
+    return ne.evaluate("100.0 * sqrt(dzdx ** 2.0 + dzdy ** 2.0)")
+
+
+def slope_degree(dzdx: FloatArray, dzdy: FloatArray) -> FloatArray:
+    """Compute Slope (degree)"""
+    rad2deg = float(180.0 / np.pi)  # noqa:F401
+    return ne.evaluate("rad2deg * arctan(sqrt(dzdx ** 2.0 + dzdy ** 2.0))")
+
+
+def slope_radians(dzdx: FloatArray, dzdy: FloatArray) -> FloatArray:
+    """Compute Slope (radians)"""
+    return ne.evaluate("arctan(sqrt(dzdx ** 2.0 + dzdy ** 2.0))")
+
+
+def compute_dzdx_dzdy(
+    dem: FloatArray,
+    res_x: float,
+    res_y: float,
+    ve_factor: float = 1.0,
+    pad: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the spatial derivatives (dzdx and dzdy) from the DEM"""
+    dem_pad = np.pad(array=dem, pad_width=pad, mode="edge") * ve_factor
+
+    nrows, ncols = dem.shape
+
+    dzdx = np.empty((nrows, ncols), dtype=np.float32)
+    dzdy = np.empty((nrows, ncols), dtype=np.float32)
+
+    tmp = np.empty((nrows, ncols), dtype=np.float32)
+    mask = np.empty((nrows, ncols), dtype=bool)
+    center_valid = ~np.isnan(dem)  # closer to RVT behavior
+
+    def load_shift(dx: int, dy: int, out: np.ndarray) -> None:
+        shifted = dem_pad[pad + dy : pad + dy + nrows, pad + dx : pad + dx + ncols]
+        np.copyto(out, shifted)
+        np.isnan(out, out=mask)
+        np.logical_and(mask, center_valid, out=mask)  # shifted is NaN, center is valid
+        np.copyto(out, dem, where=mask)
+
+    # dzdx = (right - left) / (2*res_x)
+    load_shift(-1, 0, dzdx)  # equivalent to a np.roll to the right
+    load_shift(1, 0, tmp)  # equivalent to a np.roll to the left
+    np.subtract(dzdx, tmp, out=dzdx)
+    dzdx /= 2.0 * res_x
+
+    # dzdy = (up - down) / (2*res_y)  (matches RVT sign convention)
+    load_shift(0, 1, dzdy)  # equivale to a np.roll upwards
+    load_shift(0, -1, tmp)  # equivalent to a np.roll downwards
+    np.subtract(dzdy, tmp, out=dzdy)
+    dzdy /= 2.0 * res_y
+
+    return dzdx, dzdy
+
+
+def slope_aspect(
+    dem: FloatArray,
+    resolution_x: float = 1,
+    resolution_y: float = 1,
+    output_units: str = "radian",
+    ve_factor: float = 1,
+    no_data: float | None = None,
+) -> dict[str, FloatArray]:
     """
-    Procedure can return terrain slope and aspect in radian units (default) or in alternative units (if specified).
+    Procedure can return terrain slope and aspect in radian units (default)
+    or in alternative units (if specified).
     Available alternative units are 'degree' and 'percent'.
     Slope is defined as 0 for horizontal plane and pi/2 for vertical plane.
-    Aspect is defined as geographic azimuth: clockwise increasing, 0 or 2pi for the North direction.
+    Aspect is defined as geographic azimuth: clockwise increasing, 0 or 2pi
+    for the North direction.
          0
      270    90
         180
@@ -133,78 +210,75 @@ def slope_aspect(dem,
 
     Parameters
     ----------
-    dem : numpy.ndarray
-        Input digital elevation model as 2D numpy array.
+    dem : FloatArray (dims={nrows, ncols})
+        Input digital elevation model
     resolution_x : float
         DEM resolution in X direction.
     resolution_y : float
         DEM resolution in Y direction.
     output_units : str
-        Output units, you can choose between: percent, degree, radian. Default value is radian.
+        Output units, options include {'percent', 'degree', 'radian'}.
+        Default value is radian.
     ve_factor : int or float
         Vertical exaggeration factor.
-    no_data : int or float
-        Value that represents no_data, all pixels with this value are changed to np.nan. Only has to be specified if
-        a numerical value is used for nodata (e.g. -9999).
+    no_data : float | None
+        Value that represents no_data, all pixels with this value are
+        changed to np.nan. Only has to be specified if a numerical
+        value is used for nodata (e.g. -9999).
 
     Returns
     -------
-    dict_out: dict
+    dict_out: dict[str, FloatArray]
         Returns {"slope": slope_out, "aspect": aspect_out};
-        slope_out, slope gradient : 2D numpy array (numpy.ndarray) of slope;
-        aspect_out, aspect : 2D numpy array (numpy.ndarray) of aspect.
+        slope_out : FloatArray (dims={nrows, ncols})
+            slope gradient
+        aspect_out : FloatArray (dims={nrows, ncols})
+            aspect
     """
+    emsg = "rvt.visualization.slope_aspect: {0}"
     if dem.ndim != 2:
-        raise Exception("rvt.visualization.slope_aspect: dem has to be 2D np.array!")
+        raise ValueError(emsg.format("dem must be 2D np.ndarray"))
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.slope_aspect: ve_factor must be between -10000 and 10000!")
+        raise ValueError(emsg.format("`ve_factor` must range between [-10000, 10000]"))
     if resolution_x < 0 or resolution_y < 0:
-        raise Exception("rvt.visualization.slope_aspect: resolution must be a positive number!")
+        raise ValueError(emsg.format("resolution must be a positive number"))
 
-    # Make sure array has the correct dtype!
+    slope_funcs: dict[str, Callable] = {
+        "percent": slope_percent,
+        "degree": slope_degree,
+        "radian": slope_radians,
+    }
+    if output_units not in slope_funcs:
+        raise ValueError(
+            emsg.format(f"Specified `output_units` (={output_units}) not supported")
+        )
+
+    # recast to float32 before changing `no_data` to np.nan
     dem = dem.astype(np.float32)
-
-    # Change no_data to np.nan
-    if no_data is not None:
+    if (no_data is not None) and (not np.isnan(no_data)):
         dem[dem == no_data] = np.nan
 
-    # Save NaN mask
-    nan_dem = np.isnan(dem)
+    nan_dem = np.isnan(dem)  # store NaN mask
 
-    # Add 1 pixel edge padding
-    dem = np.pad(array=dem, pad_width=1, mode="edge")
+    dzdx, dzdy = compute_dzdx_dzdy(
+        dem=dem, res_x=resolution_x, res_y=resolution_y, ve_factor=ve_factor, pad=1
+    )
 
-    # Vertical exaggeration
-    dem = dem * ve_factor
-
-    # Derivatives in X and Y direction
-    dzdx = ((roll_fill_nans(dem, 1, axis=1) - roll_fill_nans(dem, -1, axis=1)) / 2) / resolution_x
-    dzdy = ((roll_fill_nans(dem, -1, axis=0) - roll_fill_nans(dem, 1, axis=0)) / 2) / resolution_y
-    tan_slope = np.sqrt(dzdx ** 2 + dzdy ** 2)
-
-    # Compute slope
-    if output_units == "percent":
-        slope_out = tan_slope * 100
-    elif output_units == "degree":
-        slope_out = np.rad2deg(np.arctan(tan_slope))
-    elif output_units == "radian":
-        slope_out = np.arctan(tan_slope)
-    else:
-        raise Exception("rvt.visualization.calculate_slope: Wrong function input 'output_units'!")
+    # Compute Slope
+    slope_out = slope_funcs[output_units](dzdx=dzdx, dzdy=dzdy)
 
     # Compute Aspect
-    # aspect identifies the down slope direction of the maximum rate of change in value from each cell to its neighbors:
+    # aspect identifies the down slope direction of the maximum rate of change
+    # in value from each cell to its neighbors:
     #     0
     # 270    90
     #    180
-    dzdy[dzdy == 0] = 10e-9  # important for numeric stability - where dzdy is zero, make tangent to really high value
+    # important for numeric stability - where dzdy is zero,
+    # make tangent to really high value
+    dzdy[dzdy == 0] = 10e-9
     aspect_out = np.arctan2(dzdx, dzdy)  # atan2 took care of the quadrants
     if output_units == "degree":
         aspect_out = np.rad2deg(aspect_out)
-
-    # Remove padding
-    aspect_out = aspect_out[1:-1, 1:-1]
-    slope_out = slope_out[1:-1, 1:-1]
 
     # Apply NaN mask
     slope_out[nan_dem] = np.nan
@@ -215,8 +289,10 @@ def slope_aspect(dem,
 
 def roll_fill_nans(dem, shift, axis):
     """
-    Uses numpy.roll() function to roll array, then checks element-wise if new array has NaN value, but there was a
-    numerical value in the source array, then use the original value instead of NaN. It is equivalent to edge padding.
+    Uses numpy.roll() function to roll array, then checks element-wise
+    if new array has NaN value, but there was a numerical value in the
+    source array, then use the original value instead of NaN. It is
+    equivalent to edge padding.
 
     https://numpy.org/doc/stable/reference/generated/numpy.roll.html#numpy.roll
     """
@@ -228,107 +304,113 @@ def roll_fill_nans(dem, shift, axis):
     return out
 
 
-def hillshade(dem,
-              resolution_x,
-              resolution_y,
-              sun_azimuth=315,
-              sun_elevation=35,
-              slope=None,
-              aspect=None,
-              ve_factor=1,
-              no_data=None
-              ):
+def hillshade(
+    dem: FloatArray,
+    resolution_x: float,
+    resolution_y: float,
+    sun_azimuth: float = 315,
+    sun_elevation: float = 35,
+    slope: FloatArray | None = None,
+    aspect: FloatArray | None = None,
+    ve_factor: float = 1,
+    no_data=None,
+) -> FloatArray:
     """
     Compute hillshade.
 
     Parameters
     ----------
-    dem : numpy.ndarray
-        Input digital elevation model as 2D numpy array.
-    resolution_x : int
+    dem : FloatArray (dims={nrows, ncols})
+        Input digital elevation model
+    resolution_x : float
         DEM resolution in X direction.
-    resolution_y : int
+    resolution_y : float
         DEM resolution in Y direction.
-    sun_azimuth : int or float
+    sun_azimuth : float
         Solar azimuth angle (clockwise from North) in degrees.
-    sun_elevation : int or float
+    sun_elevation : float
         Solar vertical angle (above the horizon) in degrees.
-    slope : numpy.ndarray
-        Slope arr in radians if you don't input it, it is calculated.
-    aspect : numpy.ndarray
-        Aspect arr in radians if you don't input it, it is calculated.
-    ve_factor : int or float
+    slope : FloatArray (dims={nrows, ncols}) | None
+        Slope in radians
+    aspect : FloatArray (dims={nrows, ncols}) | None
+        Aspect in radians
+    ve_factor : float
         Vertical exaggeration factor.
-    no_data : int or float
-        Value that represents no_data, all pixels with this value are changed to np.nan.
+    no_data : float
+        Value that represents no_data, all pixels with this value
+        are changed to np.nan.
 
     Returns
     -------
-    hillshade_out : numpy.ndarray
+    hillshade_out : FloatArray
         Result hillshade 2D numpy array.
     """
+    emsg = "rvt.visualization.hillshade: {0}"
     if dem.ndim != 2:
-        raise Exception("rvt.visualization.hillshade: dem has to be 2D np.array!")
+        raise Exception(emsg.format("dem must be 2D np.ndarray"))
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.hillshade: ve_factor must be between -10000 and 10000!")
-    if sun_azimuth > 360 or sun_elevation > 90 or sun_azimuth < 0 or sun_elevation < 0:
-        raise Exception("rvt.visualization.hillshade: sun_azimuth must be [0-360] and sun_elevation [0-90]!")
+        raise Exception(emsg.format("`ve_factor` must range between [-10000, 10000]"))
+    if sun_azimuth > 360 or sun_azimuth < 0:
+        raise Exception(emsg.format("`sun_azimuth` must range between [0-360]"))
+    if sun_elevation > 90 or sun_elevation < 0:
+        raise Exception(emsg.format("`sun_elevation` must range between [0-90]"))
     if resolution_x < 0 or resolution_y < 0:
-        raise Exception("rvt.visualization.hillshade: resolution must be a positive number!")
+        raise Exception(emsg.format("resolution must be a positive number"))
 
-    # change no_data to np.nan
-    if no_data is not None:
+    # recast to float32 before changing `no_data` to np.nan
+    dem = dem.astype("float32")
+    if (no_data is not None) and (not np.isnan(no_data)):
         dem[dem == no_data] = np.nan
 
-    dem = dem.astype(np.float32)
     # add 1 pixel edge padding
-    dem = np.pad(array=dem, pad_width=1, mode="edge")
-    dem = dem * ve_factor
-
-    # Convert solar position (degrees) to radians
-    sun_azimuth_rad = np.deg2rad(sun_azimuth)
-    sun_elevation_rad = np.deg2rad(sun_elevation)
-
-    # Convert to solar zenith angle
-    sun_zenith_rad = np.pi / 2 - sun_elevation_rad
+    dem = np.pad(array=dem, pad_width=1, mode="edge") * ve_factor
 
     # are slope and aspect already calculated and presented
     if slope is None or aspect is None:
         # calculates slope and aspect
-        dict_slp_asp = slope_aspect(dem=dem, resolution_x=resolution_x, resolution_y=resolution_y,
-                                    output_units="radian")
+        dict_slp_asp = slope_aspect(
+            dem=dem,
+            resolution_x=resolution_x,
+            resolution_y=resolution_y,
+            output_units="radian",
+        )
         slope = dict_slp_asp["slope"]
         aspect = dict_slp_asp["aspect"]
+        del dict_slp_asp
 
-    # Compute solar incidence angle, hillshading
-    hillshade_out = np.cos(sun_zenith_rad) * np.cos(slope) + np.sin(sun_zenith_rad) * np.sin(slope) * np.cos(
-        aspect - sun_azimuth_rad)
-
+    # Convert solar position (degrees) to radians
+    sun_azimuth_rad = np.deg2rad(sun_azimuth)
+    # Convert to solar zenith angle
+    sun_zenith_rad = 0.5 * np.pi - np.deg2rad(sun_elevation)
+    # Compute solar incidence angle, hillshading using numexpr
+    hillshade_out = ne.evaluate(
+        "cos(sun_zenith_rad) * cos(slope) "
+        "+ sin(sun_zenith_rad) * sin(slope) * cos(aspect - sun_azimuth_rad)"
+    )
     hillshade_out[hillshade_out < 0] = 0  # set all negative to 0
 
-    # remove padding
-    hillshade_out = hillshade_out[1:-1, 1:-1]
-
-    return hillshade_out
+    # return interior (unpadded) hillshade image
+    return hillshade_out[1:-1, 1:-1]
 
 
-def multi_hillshade(dem,
-                    resolution_x,
-                    resolution_y,
-                    nr_directions=16,
-                    sun_elevation=35,
-                    slope=None,
-                    aspect=None,
-                    ve_factor=1,
-                    no_data=None
-                    ):
+def multi_hillshade(
+    dem: FloatArray,
+    resolution_x: float,
+    resolution_y: float,
+    nr_directions: int = 16,
+    sun_elevation: int = 35,
+    slope: FloatArray | None = None,
+    aspect: FloatArray | None = None,
+    ve_factor: float = 1,
+    no_data: float | None = None,
+):
     """
     Calculates hillshades from multiple directions.
 
     Parameters
     ----------
-    dem : numpy.ndarray
-        Input digital elevation model as 2D numpy array.
+    dem : FloatArray (dims={nrows, ncols})
+        Input digital elevation model
     resolution_x : int
         DEM resolution in X direction.
     resolution_y : int
@@ -337,54 +419,66 @@ def multi_hillshade(dem,
         Number of solar azimuth angles (clockwise from North).
     sun_elevation : int or float
         Solar vertical angle (above the horizon) in degrees.
-    slope : numpy.ndarray
-        Slope in radians if you don't input it, it is calculated.
-    aspect : numpy.ndarray
-        Aspect in radians if you don't input it, it is calculated.
-    ve_factor : int or float
+    slope : None | FloatArray (dims={nrows, ncols})
+        Slope in radians
+    aspect : None | FloatArray (dims={nrows, ncols})
+        Aspect in radians
+    ve_factor : float
         Vertical exaggeration factor.
-    no_data : int or float
+    no_data : float | None
         Value that represents no_data, all pixels with this value are changed to np.nan .
 
     Returns
     -------
-    multi_hillshade_out : numpy.ndarray
-        Result multiple direction hillshade multidimensional (nr_directions=dimensions) numpy array.
+    multi_hillshade_out : FloatArray (dims={nr_dimensions, nrow, ncol})
+        multidirectional hillshape
     """
+    emsg = "rvt.visualization.multi_hillshade: {0}"
     if dem.ndim != 2:
-        raise Exception("rvt.visualization.multi_hillshade: dem has to be 2D np.array!")
+        raise Exception(emsg.format("dem has to be 2D np.ndarray"))
     if sun_elevation > 90 or sun_elevation < 0:
-        raise Exception("rvt.visualization.multi_hillshade: sun_elevation must be [0-90]!")
+        raise Exception(emsg.format("`sun_elevation` must be between [0-90]"))
     if resolution_x < 0 or resolution_y < 0:
-        raise Exception("rvt.visualization.multi_hillshade: resolution must be a positive number!")
+        raise Exception(emsg.format("resolution must be a positive number"))
     if nr_directions < 1:
-        raise Exception("rvt.visualization.multi_hillshade: nr_directions must be a positive number!")
+        raise Exception(emsg.format("`nr_directions` must be a positive number"))
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.multi_hillshade: ve_factor must be between -10000 and 10000!")
+        raise Exception(emsg.format("`ve_factor` must be between [-10000, 10000]"))
 
-    # change no_data to np.nan
-    if no_data is not None:
-        dem[dem == no_data] = np.nan
-
+    # recast to float32 before changing `no_data` to np.nan
     dem = dem.astype(np.float32)
-    dem = dem * ve_factor
+    if (no_data is not None) and (not np.isnan(no_data)):
+        dem[dem == no_data] = np.nan
+    dem *= ve_factor
 
     # calculates slope and aspect if they are not added
-    if slope is None or aspect is None:  # slope and aspect are the same, so we have to calculate it once
-        dict_slp_asp = slope_aspect(dem=dem, resolution_x=resolution_x, resolution_y=resolution_y,
-                                    output_units="radian")
+    if slope is None or aspect is None:
+        dict_slp_asp = slope_aspect(
+            dem=dem,
+            resolution_x=resolution_x,
+            resolution_y=resolution_y,
+            output_units="radian",
+        )
         slope = dict_slp_asp["slope"]
         aspect = dict_slp_asp["aspect"]
+        del dict_slp_asp
 
-    hillshades_arr_list = []  # list of all hillshades in different directions
+    hillshades_arr_list: list[FloatArray] = []
     for i_direction in range(nr_directions):
         sun_azimuth = (360 / nr_directions) * i_direction
-        hillshading = hillshade(dem=dem, resolution_x=resolution_x, resolution_y=resolution_y,
-                                sun_elevation=sun_elevation, sun_azimuth=sun_azimuth, slope=slope, aspect=aspect)
+        hillshading = hillshade(
+            dem=dem,
+            resolution_x=resolution_x,
+            resolution_y=resolution_y,
+            sun_elevation=sun_elevation,
+            sun_azimuth=sun_azimuth,
+            slope=slope,
+            aspect=aspect,
+            ve_factor=1.0,  # `ve_factor` applied above, hence must be 1.0 here
+        )
         hillshades_arr_list.append(hillshading)
-    multi_hillshade_out = np.asarray(hillshades_arr_list)
 
-    return multi_hillshade_out
+    return np.asarray(hillshades_arr_list)
 
 
 def mean_filter(dem, kernel_radius):
@@ -413,30 +507,32 @@ def mean_filter(dem, kernel_radius):
 
     dem_i1 = integral_image(dem_pad)
 
-    kernel_nr_pix_arr = (np.roll(dem_i_nr_pixels, (radius_cell, radius_cell), axis=(0, 1)) +
-                         np.roll(dem_i_nr_pixels, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1)) -
-                         np.roll(dem_i_nr_pixels, (-radius_cell - 1, radius_cell), axis=(0, 1)) -
-                         np.roll(dem_i_nr_pixels, (radius_cell, -radius_cell - 1), axis=(0, 1)))
-    mean_out = (np.roll(dem_i1, (radius_cell, radius_cell), axis=(0, 1)) +
-                np.roll(dem_i1, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1)) -
-                np.roll(dem_i1, (-radius_cell - 1, radius_cell), axis=(0, 1)) -
-                np.roll(dem_i1, (radius_cell, -radius_cell - 1), axis=(0, 1)))
+    kernel_nr_pix_arr = (
+        np.roll(dem_i_nr_pixels, (radius_cell, radius_cell), axis=(0, 1))
+        + np.roll(dem_i_nr_pixels, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1))
+        - np.roll(dem_i_nr_pixels, (-radius_cell - 1, radius_cell), axis=(0, 1))
+        - np.roll(dem_i_nr_pixels, (radius_cell, -radius_cell - 1), axis=(0, 1))
+    )
+    mean_out = (
+        np.roll(dem_i1, (radius_cell, radius_cell), axis=(0, 1))
+        + np.roll(dem_i1, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1))
+        - np.roll(dem_i1, (-radius_cell - 1, radius_cell), axis=(0, 1))
+        - np.roll(dem_i1, (radius_cell, -radius_cell - 1), axis=(0, 1))
+    )
     # Ignore warnings for dividing with nan
-    with np.errstate(divide='ignore', invalid='ignore'):
+    with np.errstate(divide="ignore", invalid="ignore"):
         mean_out = mean_out / kernel_nr_pix_arr
     mean_out = mean_out.astype(np.float32)
-    mean_out = mean_out[radius_cell:-(radius_cell + 1), radius_cell:-(radius_cell + 1)]  # remove padding
+    mean_out = mean_out[
+        radius_cell : -(radius_cell + 1), radius_cell : -(radius_cell + 1)
+    ]  # remove padding
     # nan back to nan
     mean_out[idx_nan_dem] = np.nan
 
     return mean_out
 
 
-def slrm(dem,
-         radius_cell=20,
-         ve_factor=1,
-         no_data=None
-         ):
+def slrm(dem, radius_cell=20, ve_factor=1, no_data=None):
     """
     Calculates Simple local relief model.
 
@@ -459,9 +555,13 @@ def slrm(dem,
     if dem.ndim != 2:
         raise Exception("rvt.visualization.slrm: dem has to be 2D np.array!")
     if radius_cell < 10 or radius_cell > 50:
-        raise Exception("rvt.visualization.slrm: Radius for trend assessment needs to be in interval 10-50 pixels!")
+        raise Exception(
+            "rvt.visualization.slrm: Radius for trend assessment needs to be in interval 10-50 pixels!"
+        )
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.slrm: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.slrm: ve_factor must be between -10000 and 10000!"
+        )
 
     # change no_data to np.nan
     if no_data is not None:
@@ -477,10 +577,9 @@ def slrm(dem,
     return slrm_out
 
 
-def horizon_shift_vector(num_directions=16,
-                         radius_pixels=10,
-                         min_radius=1
-                         ):
+def horizon_shift_vector(
+    num_directions: int = 16, radius_pixels: int = 10, min_radius: int = 1
+) -> dict[float, dict[str, FloatArray | list[tuple[int, int]]]]:
     """
     Calculates Sky-View determination movements.
 
@@ -495,12 +594,15 @@ def horizon_shift_vector(num_directions=16,
 
     Returns
     -------
-    shift : dict
-        Dict with keys corresponding to the directions of search azimuths rounded to 1 decimal number
-            - for each key, a subdict contains a key "shift":
-                values for this key is a list of tuples prepared for np.roll - shift along lines and columns
-            - the second key is "distance":
-                values for this key is a list of search radius used for the computation of the elevation angle 
+    shift : dict[float, dict[str, FloatArray | list[tuple[int, int]]]]
+        Dict with keys corresponding to the directions of search azimuths
+        rounded to 1 decimal number
+            - "distance": FloatArray
+                values for this key is a list of search radius used for
+                the computation of the elevation angle
+            - "shift": list[tuple[int, int]]
+                values for this key is a list of tuples prepared for
+                np.roll - shift along lines and columns
     """
 
     # Initialize the output dict
@@ -517,7 +619,7 @@ def horizon_shift_vector(num_directions=16,
     # Make it finer for the selected scaling.
     # By adding the last constant we make sure that we do not start with
     # point (0,0).
-    scale = 3.
+    scale = 3.0
     radii = np.arange((radius_pixels - min_radius) * scale + 1) / scale + min_radius
 
     # For each direction compute all possible horizon point position
@@ -528,45 +630,50 @@ def horizon_shift_vector(num_directions=16,
         # consider only the minimal number of points
         # use the trick with set and complex number as the input
         coord_complex = set(x_int + 1j * y_int)
-        # to sort proportional with increasing radius, 
+        # to sort proportional with increasing radius,
         # set has to be converted to numpy array
         shift_pairs = np.array([(k.real, k.imag) for k in coord_complex]).astype(int)
-        distance = np.sqrt(np.sum(shift_pairs ** 2, axis=1))
+        distance = np.sqrt(np.sum(shift_pairs**2, axis=1))
         sort_index = np.argsort(distance)
         # write for each direction shifts and corresponding distances
-        shift[angles[i]] = {
-            "shift": [(k[0], k[1]) for k in shift_pairs[sort_index]],
+        shift[float(angles[i])] = {
+            "shift": [(int(k[0]), int(k[1])) for k in shift_pairs[sort_index]],
             "distance": distance[sort_index],
         }
 
     return shift
 
 
-def sky_view_factor_compute(height_arr,
-                            radius_max=10,
-                            radius_min=1,
-                            num_directions=16,
-                            compute_svf=True,
-                            compute_opns=False,
-                            compute_asvf=False,
-                            a_main_direction=315.,
-                            a_poly_level=4,
-                            a_min_weight=0.4
-                            ):
+def sky_view_factor_compute(
+    height_arr: FloatArray,
+    radius_max: int = 10,
+    radius_min: int = 1,
+    num_directions: int = 16,
+    compute_svf: bool = True,
+    compute_opns: bool = False,
+    compute_asvf: bool = False,
+    a_main_direction: float = 315.0,
+    a_poly_level: int = 4,
+    a_min_weight: float = 0.4,
+) -> dict[str, FloatArray]:
     """
-    Calculates horizon based visualizations: Sky-view factor, Anisotropic SVF and Openness.
+    Calculates horizon based visualizations
 
-    SVF processing is using search radius, that looks at values beyond the edge of an array. Consider using a buffered
-    array as an input, with the buffer size equal to the radius_max.
-    To prevent erosion of the edge, function applies mirrored padding in all four directions, however, this means that
-    edge values are "averaged over half of the hemisphere". Similarly, the edges of the dataset (i.e. areas with NaN
-    values), will be considered as fully open (SFV angle 0, Openness angle -90).
+    Specifically Sky-view factor, Anisotropic SVF and Openness.
+
+    SVF processing is using search radius, that looks at values beyond the
+    edge of an array. Consider using a buffered array as an input, with the
+    buffer size equal to the `radius_max`. To prevent erosion of the edge,
+    function applies mirrored padding in all four directions, however, this
+    means that edge values are "averaged over half of the hemisphere".
+    Similarly, the edges of the dataset (i.e. areas with NaN values), will
+    be considered as fully open (SFV angle 0, Openness angle -90).
 
     Input array should use np.nan as nodata value.
 
     Parameters
     ----------
-    height_arr : numpy.ndarray
+    height_arr : FloatArray
         Elevation (DEM) as 2D numpy array.
     radius_max : int
         Maximal search radius in pixels/cells (not in meters).
@@ -580,39 +687,52 @@ def sky_view_factor_compute(height_arr,
         If true it computes and outputs asvf.
     compute_opns : bool
         If true it computes and outputs opns.
-    a_main_direction : int or float
+    a_main_direction : float
         Main direction of anisotropy.
     a_poly_level : int
         Level of polynomial that determines the anisotropy.
     a_min_weight : float
         Weight to consider anisotropy:
-                 0 - low anisotropy, 
-                 1 - high  anisotropy (no illumination from the direction opposite the main direction)
+            0 - low anisotropy,
+            1 - high  anisotropy (no illumination from the direction
+                                  opposite the main direction)
 
     Returns
     -------
-    dict_out : dictionary
+    dict_out : dict[str, FloatArray]
         Return {"svf": svf_out, "asvf": asvf_out, "opns": opns_out};
-        svf_out, skyview factor : 2D numpy array (numpy.ndarray) of skyview factor;
-        asvf_out, anisotropic skyview factor : 2D numpy array (numpy.ndarray) of anisotropic skyview factor;
-        opns_out, openness : 2D numpy array (numpy.ndarray) openness (elevation angle of horizon).
+        svf_out: skyview factor (FloatArray if `compute_svf`=True)
+        asvf_out: anisotropic skyview factor (FloatArray if `compute_asvf`=True)
+        opns_out: openness (FloatArray if `compute_opns`=True)
     """
+    if height_arr.ndim != 2:
+        emsg = (
+            "Elevation raster must be 2D; instead it has a shape of: "
+            f"{height_arr.shape}"
+        )
+        raise ValueError(emsg)
+
+    shape = height_arr.shape
 
     # Pad the array for the radius_max on all 4 sides
-    height = np.pad(height_arr, radius_max, mode='reflect')
+    height_pad = np.pad(height_arr, radius_max, mode="reflect")
 
     # Compute the vector of movement and corresponding distances
-    move = horizon_shift_vector(num_directions=num_directions, radius_pixels=radius_max, min_radius=radius_min)
+    move = horizon_shift_vector(
+        num_directions=num_directions, radius_pixels=radius_max, min_radius=radius_min
+    )
 
     # Initiate the output for SVF
     if compute_svf:
-        svf_out = height * 0  # Multiply with 0 instead of using np.zeros to preserve nodata
+        # Multiply with 0 instead of using np.zeros to preserve nodata
+        svf_out = height_arr * 0
     else:
         svf_out = None
 
     # Initiate the output for azimuth dependent SVF
     if compute_asvf:
-        asvf_out = height * 0  # Multiply with 0 instead of using np.zeros to preserve nodata
+        # Multiply with 0 instead of using np.zeros to preserve nodata
+        asvf_out = height_arr * 0
         w_m = a_min_weight
         w_a = np.deg2rad(a_main_direction)
         weight = np.arange(num_directions) * (2 * np.pi / num_directions)
@@ -623,68 +743,91 @@ def sky_view_factor_compute(height_arr,
 
     # Initiate the output for Openness
     if compute_opns:
-        opns_out = height * 0  # Multiply with 0 instead of using np.zeros to preserve nodata
+        # Multiply with 0 instead of using np.zeros to preserve nodata
+        opns_out = height_arr * 0
     else:
         opns_out = None
 
+    tmp_fill_val = -1000
     # Search for horizon in each direction...
-    for i_dir, direction in enumerate(move):
-        # Reset maximum at each iteration (i.e. at the start of new direction),
-        # smallest possible elevation angle is -1000 rad (i.e. -90 deg)
-        max_slope = np.zeros(height.shape, dtype=np.float32) - 1000
+    max_slope = np.full(shape, fill_value=tmp_fill_val, dtype=np.float32)
+    unshifted_ix = np.s_[
+        radius_max : radius_max + shape[0], radius_max : radius_max + shape[1]
+    ]
 
-        # ... and for each search radius
+    for i_dir, direction in enumerate(move):
         for i_rad, radius in enumerate(move[direction]["distance"]):
-            # Get shift index from move dictionary
-            shift_indx = move[direction]["shift"][i_rad]
+            # original code is computationally expensive:
             # Estimate the slope
-            _ = (np.roll(height, shift_indx, axis=(0, 1)) - height) / radius
-            # Compare to the previous max slope and keep the largest values (element wise). Use np.fmax to prevent NaN
-            # values contaminating the edge of the image (if one of the elements is NaN, pick non-NaN element)
-            max_slope = np.fmax(max_slope, _)
+            # > shift_indx = move[direction]["shift"][i_rad]
+            # > _ = (np.roll(height_pad, shift_indx, axis=(0, 1)) - height_pad) / radius
+            # > max_slope = np.fmax(max_slope, _)
+
+            # Get shift index from move dictionary
+            dx, dy = move[direction]["shift"][i_rad]
+            shifted_ix = np.s_[
+                radius_max + dy : radius_max + dy + shape[0],
+                radius_max + dx : radius_max + dx + shape[1],
+            ]
+
+            # Compare to the previous max slope and keep the largest values
+            # (element wise). Use np.fmax to prevent NaN values contaminating
+            # the edge of the image (if one of the elements is NaN, pick
+            #                         non-NaN element)
+            np.fmax(
+                max_slope,
+                (height_pad[shifted_ix] - height_pad[unshifted_ix]) / radius,
+                out=max_slope,
+            )
 
         # Convert to angle in radians and compute directional output
         max_slope = np.arctan(max_slope)
 
         # Sum max angle for all directions
         if compute_svf:
-            # For SVF minimum possible angle is 0 (hemisphere), use np.fmax() to change NaNs to 0
-            svf_out = svf_out + (1 - np.sin(np.fmax(max_slope, 0)))
+            # For SVF minimum possible angle is 0 (hemisphere),
+            # use np.fmax() to change NaNs to 0
+            svf_out += 1 - np.sin(np.fmax(max_slope, 0))
         if compute_asvf:
-            # For SVF minimum possible angle is 0 (hemisphere), use np.fmax() to change NaNs to 0
-            asvf_out = asvf_out + (1 - np.sin(np.fmax(max_slope, 0))) * weight[i_dir]
+            # For SVF minimum possible angle is 0 (hemisphere),
+            # use np.fmax() to change NaNs to 0
+            asvf_out += (1 - np.sin(np.fmax(max_slope, 0))) * weight[i_dir]
         if compute_opns:
             # For Openness taking the entire sphere
-            opns_out = opns_out + max_slope
+            opns_out += max_slope
 
-    # Cut to original extent and average the directional output over all directions
+        # Reset maximum at each iteration (i.e. at the start of new direction),
+        # smallest possible elevation angle is -1000 rad (i.e. -90 deg)
+        max_slope.fill(tmp_fill_val)
+
+    # average the directional output over all directions
+    dict_svf_asvf_opns = {}
     if compute_svf:
-        svf_out = svf_out[radius_max:-radius_max, radius_max:-radius_max] / num_directions
+        dict_svf_asvf_opns["svf"] = svf_out / num_directions
     if compute_asvf:
-        asvf_out = asvf_out[radius_max:-radius_max, radius_max:-radius_max] / np.sum(weight)
+        dict_svf_asvf_opns["asvf"] = asvf_out / np.sum(weight)
     if compute_opns:
-        opns_out = np.rad2deg(0.5 * np.pi - (opns_out[radius_max:-radius_max, radius_max:-radius_max] / num_directions))
-
-    # Return results within dict
-    dict_svf_asvf_opns = {"svf": svf_out, "asvf": asvf_out, "opns": opns_out}
-    dict_svf_asvf_opns = {k: v for k, v in dict_svf_asvf_opns.items() if v is not None}  # filter out none
+        dict_svf_asvf_opns["opns"] = np.rad2deg(
+            0.5 * np.pi - (opns_out / num_directions)
+        )
 
     return dict_svf_asvf_opns
 
 
-def sky_view_factor(dem,
-                    resolution,
-                    compute_svf=True,
-                    compute_opns=False,
-                    compute_asvf=False,
-                    svf_n_dir=16,
-                    svf_r_max=10,
-                    svf_noise=0,
-                    asvf_dir=315,
-                    asvf_level=1,
-                    ve_factor=1,
-                    no_data=None
-                    ):
+def sky_view_factor(
+    dem,
+    resolution,
+    compute_svf=True,
+    compute_opns=False,
+    compute_asvf=False,
+    svf_n_dir=16,
+    svf_r_max=10,
+    svf_noise=0,
+    asvf_dir=315,
+    asvf_level=1,
+    ve_factor=1,
+    no_data=None,
+):
     """
     Prepare the data, call sky_view_factor_compute, reformat and return back 2D arrays.
 
@@ -729,17 +872,25 @@ def sky_view_factor(dem,
     if dem.ndim != 2:
         raise Exception("rvt.visualization.sky_view_factor: dem has to be 2D np.array!")
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.sky_view_factor: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.sky_view_factor: ve_factor must be between -10000 and 10000!"
+        )
     if svf_noise != 0 and svf_noise != 1 and svf_noise != 2 and svf_noise != 3:
-        raise Exception("rvt.visualization.sky_view_factor: svf_noise must be one of the following"
-                        "values (0-don't remove, 1-low, 2-med, 3-high)!")
+        raise Exception(
+            "rvt.visualization.sky_view_factor: svf_noise must be one of the following"
+            "values (0-don't remove, 1-low, 2-med, 3-high)!"
+        )
     if asvf_level != 1 and asvf_level != 2:
-        raise Exception("rvt.visualization.sky_view_factor: asvf_leve must be one of the following"
-                        "values (1-low, 2-high)!")
+        raise Exception(
+            "rvt.visualization.sky_view_factor: asvf_leve must be one of the following"
+            "values (1-low, 2-high)!"
+        )
     if not compute_svf and not compute_asvf and not compute_opns:
         raise Exception("rvt.visualization.sky_view_factor: All computes are false!")
     if resolution < 0:
-        raise Exception("rvt.visualization.sky_view_factor: resolution must be a positive number!")
+        raise Exception(
+            "rvt.visualization.sky_view_factor: resolution must be a positive number!"
+        )
 
     # Make sure array has the correct dtype!
     dem = dem.astype(np.float32)
@@ -750,7 +901,7 @@ def sky_view_factor(dem,
     sc_asvf_min = [0.4, 0.1]
     # The portion (percent) of the maximal search radius to ignore in horizon estimation; for each noise level,
     # selected with svf_noise (0-3)
-    sc_svf_r_min = [0., 10., 20., 40.]
+    sc_svf_r_min = [0.0, 10.0, 20.0, 40.0]
 
     # Before doing anything to the array, make sure all NODATA values are set to np.nan
     if no_data is not None:
@@ -781,7 +932,7 @@ def sky_view_factor(dem,
         compute_asvf=compute_asvf,
         a_main_direction=asvf_dir,
         a_poly_level=poly_level,
-        a_min_weight=min_weight
+        a_min_weight=min_weight,
     )
 
     # Apply NaN mask to outputs
@@ -791,15 +942,16 @@ def sky_view_factor(dem,
     return dict_svf_asvf_opns
 
 
-def local_dominance(dem,
-                    min_rad=10,
-                    max_rad=20,
-                    rad_inc=1,
-                    angular_res=15,
-                    observer_height=1.7,
-                    ve_factor=1,
-                    no_data=None
-                    ):
+def local_dominance(
+    dem,
+    min_rad=10,
+    max_rad=20,
+    rad_inc=1,
+    angular_res=15,
+    observer_height=1.7,
+    ve_factor=1,
+    no_data=None,
+):
     """
     Compute Local Dominance dem visualization.
     Adapted from original version that is part of the Lidar Visualisation Toolbox LiVT developed by Ralf Hesse.
@@ -831,7 +983,9 @@ def local_dominance(dem,
     if dem.ndim != 2:
         raise Exception("rvt.visualization.local_dominance: dem has to be 2D np.array!")
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.local_dominance: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.local_dominance: ve_factor must be between -10000 and 10000!"
+        )
 
     # change no_data to np.nan
     if no_data is not None:
@@ -865,10 +1019,16 @@ def local_dominance(dem,
         dem_moved = np.roll(dem_moved, int(round(x_t[i_s])), axis=1)
         idx_lower = np.where((dem + observer_height) > dem_moved)
         if idx_lower[0].size > 0:
-            local_dom_out[idx_lower[0], idx_lower[1]] = local_dom_out[idx_lower[0], idx_lower[1]] + \
-                                                        (dem[idx_lower[0], idx_lower[1]] + observer_height -
-                                                         dem_moved[idx_lower[0], idx_lower[1]]) / \
-                                                        distances[i_s] * dist_factor[i_s]
+            local_dom_out[idx_lower[0], idx_lower[1]] = (
+                local_dom_out[idx_lower[0], idx_lower[1]]
+                + (
+                    dem[idx_lower[0], idx_lower[1]]
+                    + observer_height
+                    - dem_moved[idx_lower[0], idx_lower[1]]
+                )
+                / distances[i_s]
+                * dist_factor[i_s]
+            )
     local_dom_out = local_dom_out / norma
 
     # Remove padding
@@ -877,12 +1037,9 @@ def local_dominance(dem,
     return local_dom_out
 
 
-def horizon_generate_coarse_dem(dem_fine,
-                                pyramid_scale,
-                                conv_from,
-                                conv_to,
-                                max_radius
-                                ):
+def horizon_generate_coarse_dem(
+    dem_fine, pyramid_scale, conv_from, conv_to, max_radius
+):
     # first reduce the size for the edge required for horizon search
     dem_fine = dem_fine[max_radius:-max_radius, max_radius:-max_radius]
 
@@ -913,38 +1070,49 @@ def horizon_generate_coarse_dem(dem_fine,
 
     # Once you have data in the shape appropriate for resizing,
     # pad the data to support np.move.
-    dem_fine = np.pad(dem_fine, ((-conv_from, conv_to), (-conv_from, conv_to)), mode="symmetric")
+    dem_fine = np.pad(
+        dem_fine, ((-conv_from, conv_to), (-conv_from, conv_to)), mode="symmetric"
+    )
 
     # Convolution (keep maximum)
     dem_convolve = np.zeros(dem_fine.shape)
     for i in np.arange(pyramid_scale) + conv_from:
         for j in np.arange(pyramid_scale) + conv_from:
-            dem_convolve = np.maximum(dem_convolve, np.roll(dem_fine, (i, j), axis=(0, 1)))
+            dem_convolve = np.maximum(
+                dem_convolve, np.roll(dem_fine, (i, j), axis=(0, 1))
+            )
     # Divide by pyramid_scale to account for the change of resolution
     # (important for the angle computation later on)
     dem_convolve = dem_convolve / pyramid_scale
 
     # Consider only the selected convoluted points according to the scale change.
-    # As we select slice's end point make sure to consider at least 1 point more 
+    # As we select slice's end point make sure to consider at least 1 point more
     # to the right / below to really include it (Python way of considering end index).
-    dem_coarse = dem_convolve[-conv_from:(n_lin_coarse * pyramid_scale + 1):pyramid_scale,
-                              -conv_from:(n_col_coarse * pyramid_scale + 1):pyramid_scale]
+    dem_coarse = dem_convolve[
+        -conv_from : (n_lin_coarse * pyramid_scale + 1) : pyramid_scale,
+        -conv_from : (n_col_coarse * pyramid_scale + 1) : pyramid_scale,
+    ]
 
     # Final padding to enable searching the horizon over the edge:
-    # use constant-mode set to the minimal height, so it doesn't 
+    # use constant-mode set to the minimal height, so it doesn't
     # affect the horizon estimation.
-    dem_coarse = np.pad(dem_coarse, ((max_radius, max_radius), (max_radius, max_radius)), mode="constant",
-                        constant_values=dem_coarse.min())
+    dem_coarse = np.pad(
+        dem_coarse,
+        ((max_radius, max_radius), (max_radius, max_radius)),
+        mode="constant",
+        constant_values=dem_coarse.min(),
+    )
 
     return dem_coarse
 
 
-def horizon_generate_pyramids(dem,
-                              num_directions=4,
-                              max_fine_radius=100,
-                              max_pyramid_radius=7,
-                              pyramid_scale=3,
-                              ):
+def horizon_generate_pyramids(
+    dem,
+    num_directions=4,
+    max_fine_radius=100,
+    max_pyramid_radius=7,
+    pyramid_scale=3,
+):
     # In the levels higher than 1, determine the minimal search distance
     # and number of search distances.
     # If you have for instance
@@ -963,7 +1131,7 @@ def horizon_generate_pyramids(dem,
     n_pyramid_radius = max_pyramid_radius - min_pyramid_radius + 1
 
     # get the convolution window indices
-    conv_to = int(np.floor(pyramid_scale / 2.))
+    conv_to = int(np.floor(pyramid_scale / 2.0))
     if (pyramid_scale % 2) == 0:
         conv_from = 1 - conv_to
     else:
@@ -977,19 +1145,25 @@ def horizon_generate_pyramids(dem,
     # Determine the number of levels and
     # the last radius to be used in the highest level.
     while work:
-        _ = max_fine_radius / pyramid_scale ** pyramid_levels
+        _ = max_fine_radius / pyramid_scale**pyramid_levels
         if _ > max_pyramid_radius:
             pyramid_levels = pyramid_levels + 1
         else:
             work = False
-            last_radius = np.round(max_fine_radius / pyramid_scale ** pyramid_levels, decimals=0)
+            last_radius = np.round(
+                max_fine_radius / pyramid_scale**pyramid_levels, decimals=0
+            )
 
     # fill out the pyramid dict with the metadata required for horizon searching.
     for level in np.arange(pyramid_levels + 1):
         # the level 0 contains the other min_radius as the rest of levels
         if level == 0:
             min_radius = 1
-            dem_fine = np.copy(np.pad(dem, max_pyramid_radius, mode="constant", constant_values=dem.min()))
+            dem_fine = np.copy(
+                np.pad(
+                    dem, max_pyramid_radius, mode="constant", constant_values=dem.min()
+                )
+            )
         else:
             min_radius = min_pyramid_radius - 1
             dem_fine = np.copy(dem_coarse)
@@ -1000,7 +1174,9 @@ def horizon_generate_pyramids(dem,
             max_radius = max_pyramid_radius
         # determine the dict of shifts
         shift = horizon_shift_vector(num_directions, max_radius, min_radius)
-        dem_coarse = horizon_generate_coarse_dem(dem_fine, pyramid_scale, conv_from, conv_to, max_pyramid_radius)
+        dem_coarse = horizon_generate_coarse_dem(
+            dem_fine, pyramid_scale, conv_from, conv_to, max_pyramid_radius
+        )
         i_lin = np.arange(dem_fine.shape[0])
         i_col = np.arange(dem_fine.shape[1])
 
@@ -1017,18 +1193,19 @@ def horizon_generate_pyramids(dem,
     return pyramid
 
 
-def sky_illumination(dem,
-                     resolution,
-                     sky_model="overcast",
-                     compute_shadow=False,
-                     shadow_horizon_only=False,
-                     max_fine_radius=100,
-                     num_directions=32,
-                     shadow_az=315,
-                     shadow_el=35,
-                     ve_factor=1,
-                     no_data=None
-                     ):
+def sky_illumination(
+    dem,
+    resolution,
+    sky_model="overcast",
+    compute_shadow=False,
+    shadow_horizon_only=False,
+    max_fine_radius=100,
+    num_directions=32,
+    shadow_az=315,
+    shadow_el=35,
+    ve_factor=1,
+    no_data=None,
+):
     """
     Compute topographic corrections for sky illumination.
 
@@ -1067,13 +1244,21 @@ def sky_illumination(dem,
     max_pyramid_radius = 20
 
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.sky_illumination: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.sky_illumination: ve_factor must be between -10000 and 10000!"
+        )
     if shadow_az > 360 or shadow_az < 0:
-        raise Exception("rvt.visualization.sky_illumination: shadow_az must be between 0 and 360!")
+        raise Exception(
+            "rvt.visualization.sky_illumination: shadow_az must be between 0 and 360!"
+        )
     if shadow_el > 90 or shadow_el < 0:
-        raise Exception("rvt.visualization.sky_illumination: shadow_el must be between 0 and 90!")
+        raise Exception(
+            "rvt.visualization.sky_illumination: shadow_el must be between 0 and 90!"
+        )
     if resolution < 0:
-        raise Exception("rvt.visualization.sky_illumination: resolution must be a positive number!")
+        raise Exception(
+            "rvt.visualization.sky_illumination: resolution must be a positive number!"
+        )
 
     # change no_data to np.nan
     if no_data is not None:
@@ -1089,23 +1274,29 @@ def sky_illumination(dem,
         compute_overcast = False
         compute_uniform = True
     else:
-        raise Exception("rvt.visualization.sky_illumination: sky_model must be overcast or uniform!")
+        raise Exception(
+            "rvt.visualization.sky_illumination: sky_model must be overcast or uniform!"
+        )
 
     # generate slope and aspect
-    _ = slope_aspect(np.pad(dem, max_pyramid_radius, mode="symmetric"), resolution, resolution)
+    _ = slope_aspect(
+        np.pad(dem, max_pyramid_radius, mode="symmetric"), resolution, resolution
+    )
     slope = _["slope"]
     aspect = _["aspect"]
 
     # build DEM pyramids
-    pyramid = horizon_generate_pyramids(dem,
-                                        num_directions=num_directions,
-                                        max_fine_radius=max_fine_radius,
-                                        max_pyramid_radius=max_pyramid_radius,
-                                        pyramid_scale=pyramid_scale, )
+    pyramid = horizon_generate_pyramids(
+        dem,
+        num_directions=num_directions,
+        max_fine_radius=max_fine_radius,
+        max_pyramid_radius=max_pyramid_radius,
+        pyramid_scale=pyramid_scale,
+    )
     n_levels = np.max([i for i in pyramid])
 
     # get the convolution window indices
-    conv_to = int(np.floor(pyramid_scale / 2.))
+    conv_to = int(np.floor(pyramid_scale / 2.0))
     if (pyramid_scale % 2) == 0:
         conv_from = 1 - conv_to
     else:
@@ -1114,14 +1305,21 @@ def sky_illumination(dem,
     da = np.pi / num_directions
 
     # init the intermediate results for uniform SI
-    uniform_a = np.zeros((dem.shape[0] + 2 * max_pyramid_radius, dem.shape[1] + 2 * max_pyramid_radius),
-                         dtype=np.float32)
+    uniform_a = np.zeros(
+        (dem.shape[0] + 2 * max_pyramid_radius, dem.shape[1] + 2 * max_pyramid_radius),
+        dtype=np.float32,
+    )
     uniform_b = np.copy(uniform_a)
     # init the output for overcast SI
     if compute_overcast:
         overcast_out = np.zeros(dem.shape, dtype=np.float32)
-        overcast_c = np.zeros((dem.shape[0] + 2 * max_pyramid_radius, dem.shape[1] + 2 * max_pyramid_radius),
-                              dtype=np.float32)
+        overcast_c = np.zeros(
+            (
+                dem.shape[0] + 2 * max_pyramid_radius,
+                dem.shape[1] + 2 * max_pyramid_radius,
+            ),
+            dtype=np.float32,
+        )
         overcast_d = np.copy(overcast_c)
     else:
         overcast_out = None
@@ -1164,49 +1362,73 @@ def sky_illumination(dem,
                 # get shift index from move dictionary
                 shift_indx = move[direction]["shift"][i_rad]
                 # estimate the slope
-                _ = np.maximum((np.roll(height, shift_indx, axis=(0, 1)) - height) / radius, 0.)
+                _ = np.maximum(
+                    (np.roll(height, shift_indx, axis=(0, 1)) - height) / radius, 0.0
+                )
                 # compare to the previous max slope and keep the larges
                 max_slope = np.maximum(max_slope, _)
 
             # resample the max_slope to a lower pyramid level
             if i_level > 0:
                 lin_fine = pyramid[i_level - 1]["i_lin"] + (
-                        conv_from + max_pyramid_radius * pyramid_scale - max_pyramid_radius)
+                    conv_from + max_pyramid_radius * pyramid_scale - max_pyramid_radius
+                )
                 col_fine = pyramid[i_level - 1]["i_col"] + (
-                        conv_from + max_pyramid_radius * pyramid_scale - max_pyramid_radius)
+                    conv_from + max_pyramid_radius * pyramid_scale - max_pyramid_radius
+                )
                 lin_coarse = pyramid[i_level]["i_lin"] * pyramid_scale
                 col_coarse = pyramid[i_level]["i_col"] * pyramid_scale
-                interp_spline = RectBivariateSpline(lin_coarse, col_coarse, max_slope, kx=1, ky=1)
+                interp_spline = RectBivariateSpline(
+                    lin_coarse, col_coarse, max_slope, kx=1, ky=1
+                )
                 max_slope = interp_spline(lin_fine, col_fine)
 
         # convert to angle in radians and compute directional output
         _ = np.arctan(max_slope)
         uniform_a = uniform_a + (np.cos(_)) ** 2
         _d_aspect = -2 * np.sin(da) * np.cos(dir_rad - aspect)
-        uniform_b = uniform_b + np.maximum(_d_aspect * (np.pi / 4. - _ / 2. - np.sin(2. * _) / 4.), 0)
+        uniform_b = uniform_b + np.maximum(
+            _d_aspect * (np.pi / 4.0 - _ / 2.0 - np.sin(2.0 * _) / 4.0), 0
+        )
         if compute_overcast:
             _cos3 = (np.cos(_)) ** 3
             overcast_c = overcast_c + np.maximum(_cos3, 0)
-            overcast_d = overcast_d + np.maximum(_d_aspect * (2. / 3. - np.cos(_) + _cos3 / 3.), 0)
+            overcast_d = overcast_d + np.maximum(
+                _d_aspect * (2.0 / 3.0 - np.cos(_) + _cos3 / 3.0), 0
+            )
         if compute_shadow and (direction == shadow_az):
-            horizon_out = np.degrees(_[max_pyramid_radius:-max_pyramid_radius, max_pyramid_radius:-max_pyramid_radius])
+            horizon_out = np.degrees(
+                _[
+                    max_pyramid_radius:-max_pyramid_radius,
+                    max_pyramid_radius:-max_pyramid_radius,
+                ]
+            )
             shadow_out = (horizon_out < shadow_el) * 1
             if shadow_horizon_only:
                 return {"shadow": shadow_out, "horizon": horizon_out}
 
     # because of numeric stability check if the uniform_b is less then pi
-    uniform_out = da * np.cos(slope) * uniform_a + np.sin(slope) * np.minimum(uniform_b, np.pi)
-    uniform_out = uniform_out[max_pyramid_radius:-max_pyramid_radius, max_pyramid_radius:-max_pyramid_radius]
+    uniform_out = da * np.cos(slope) * uniform_a + np.sin(slope) * np.minimum(
+        uniform_b, np.pi
+    )
+    uniform_out = uniform_out[
+        max_pyramid_radius:-max_pyramid_radius, max_pyramid_radius:-max_pyramid_radius
+    ]
 
     if compute_overcast:
-        overcast_out = (2. * da / 3.) * np.cos(slope) * overcast_c + np.sin(slope) * overcast_d
-        overcast_out = overcast_out[max_pyramid_radius:-max_pyramid_radius, max_pyramid_radius:-max_pyramid_radius]
+        overcast_out = (2.0 * da / 3.0) * np.cos(slope) * overcast_c + np.sin(
+            slope
+        ) * overcast_d
+        overcast_out = overcast_out[
+            max_pyramid_radius:-max_pyramid_radius,
+            max_pyramid_radius:-max_pyramid_radius,
+        ]
         overcast_out = 0.33 * uniform_out + 0.67 * overcast_out
         overcast_out = overcast_out / overcast_out.max()
     if compute_shadow:
-        uniform_sh_out = (0.8 * uniform_out + 0.2 * shadow_out)
+        uniform_sh_out = 0.8 * uniform_out + 0.2 * shadow_out
         if compute_overcast:
-            overcast_sh_out = (0.8 * overcast_out + 0.2 * shadow_out)
+            overcast_sh_out = 0.8 * overcast_out + 0.2 * shadow_out
 
     # normalize
     uniform_out = uniform_out / np.pi
@@ -1233,13 +1455,9 @@ def sky_illumination(dem,
         return overcast_sh_out
 
 
-def shadow_horizon(dem,
-                   resolution,
-                   shadow_az=315,
-                   shadow_el=35,
-                   ve_factor=1,
-                   no_data=None
-                   ):
+def shadow_horizon(
+    dem, resolution, shadow_az=315, shadow_el=35, ve_factor=1, no_data=None
+):
     """
     Compute shadow and horizon.
 
@@ -1266,27 +1484,37 @@ def shadow_horizon(dem,
         horizon; 2D numpy array (numpy.ndarray) of horizon.
     """
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.shadow_horizon: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.shadow_horizon: ve_factor must be between -10000 and 10000!"
+        )
     if shadow_az > 360 or shadow_az < 0:
-        raise Exception("rvt.visualization.shadow_horizon: shadow_az must be between 0 and 360!")
+        raise Exception(
+            "rvt.visualization.shadow_horizon: shadow_az must be between 0 and 360!"
+        )
     if shadow_el > 90 or shadow_el < 0:
-        raise Exception("rvt.visualization.shadow_horizon: shadow_el must be between 0 and 90!")
+        raise Exception(
+            "rvt.visualization.shadow_horizon: shadow_el must be between 0 and 90!"
+        )
     if resolution < 0:
-        raise Exception("rvt.visualization.shadow_horizon: resolution must be a positive number!")
+        raise Exception(
+            "rvt.visualization.shadow_horizon: resolution must be a positive number!"
+        )
 
-    return sky_illumination(dem=dem, resolution=resolution, compute_shadow=True,
-                            shadow_horizon_only=True, shadow_el=shadow_el, shadow_az=shadow_az, ve_factor=ve_factor,
-                            no_data=no_data)
+    return sky_illumination(
+        dem=dem,
+        resolution=resolution,
+        compute_shadow=True,
+        shadow_horizon_only=True,
+        shadow_el=shadow_el,
+        shadow_az=shadow_az,
+        ve_factor=ve_factor,
+        no_data=no_data,
+    )
 
 
-def msrm(dem,
-         resolution,
-         feature_min,
-         feature_max,
-         scaling_factor,
-         ve_factor=1,
-         no_data=None
-         ):
+def msrm(
+    dem, resolution, feature_min, feature_max, scaling_factor, ve_factor=1, no_data=None
+):
     """
     Compute Multi-scale relief model (MSRM).
 
@@ -1314,7 +1542,9 @@ def msrm(dem,
         2D numpy result array of Multi-scale relief model.
     """
     if not (10000 >= ve_factor >= -10000):
-        raise Exception("rvt.visualization.msrm: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.msrm: ve_factor must be between -10000 and 10000!"
+        )
     if resolution < 0:
         raise Exception("rvt.visualization.msrm: resolution must be a positive number!")
 
@@ -1331,21 +1561,31 @@ def msrm(dem,
     scaling_factor = int(scaling_factor)  # has to be integer
 
     # calculation of i and n (from article)
-    i = int(np.floor(((feature_min - resolution) / (2 * resolution)) ** (1 / scaling_factor)))
-    n = int(np.ceil(((feature_max - resolution) / (2 * resolution)) ** (1 / scaling_factor)))
+    i = int(
+        np.floor(
+            ((feature_min - resolution) / (2 * resolution)) ** (1 / scaling_factor)
+        )
+    )
+    n = int(
+        np.ceil(((feature_max - resolution) / (2 * resolution)) ** (1 / scaling_factor))
+    )
 
     # lpf = low pass filter
     relief_models_sum = np.zeros(dem.shape)  # sum of all substitution of 2 consecutive
-    nr_relief_models = 0  # number of additions (substitutions of 2 consecutive surfaces)
+    nr_relief_models = (
+        0  # number of additions (substitutions of 2 consecutive surfaces)
+    )
     last_lpf_surface = 0
 
     # generation of filtered surfaces (lpf_surface)
     for ndx in range(i, n + 1, 1):
-        kernel_radius = ndx ** scaling_factor
+        kernel_radius = ndx**scaling_factor
         # calculate mean filtered surface
         lpf_surface = mean_filter(dem=dem, kernel_radius=kernel_radius)
         if not ndx == i:  # if not first surface
-            relief_models_sum += (last_lpf_surface - lpf_surface)  # substitution of 2 consecutive lpf_surface
+            relief_models_sum += (
+                last_lpf_surface - lpf_surface
+            )  # substitution of 2 consecutive lpf_surface
             nr_relief_models += 1
         last_lpf_surface = lpf_surface
 
@@ -1416,31 +1656,43 @@ def topographic_dev(dem, dem_i_nr_pixels, dem_i1, dem_i2, kernel_radius):
     if radius_cell <= 0:
         return dem
 
-    kernel_nr_pix_arr = (np.roll(dem_i_nr_pixels, (radius_cell, radius_cell), axis=(0, 1)) +
-                         np.roll(dem_i_nr_pixels, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1)) -
-                         np.roll(dem_i_nr_pixels, (-radius_cell - 1, radius_cell), axis=(0, 1)) -
-                         np.roll(dem_i_nr_pixels, (radius_cell, -radius_cell - 1), axis=(0, 1)))
+    kernel_nr_pix_arr = (
+        np.roll(dem_i_nr_pixels, (radius_cell, radius_cell), axis=(0, 1))
+        + np.roll(dem_i_nr_pixels, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1))
+        - np.roll(dem_i_nr_pixels, (-radius_cell - 1, radius_cell), axis=(0, 1))
+        - np.roll(dem_i_nr_pixels, (radius_cell, -radius_cell - 1), axis=(0, 1))
+    )
 
     # sum
-    dem_mean = (np.roll(dem_i1, (radius_cell, radius_cell), axis=(0, 1)) +
-                np.roll(dem_i1, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1)) -
-                np.roll(dem_i1, (-radius_cell - 1, radius_cell), axis=(0, 1)) -
-                np.roll(dem_i1, (radius_cell, -radius_cell - 1), axis=(0, 1)))
+    dem_mean = (
+        np.roll(dem_i1, (radius_cell, radius_cell), axis=(0, 1))
+        + np.roll(dem_i1, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1))
+        - np.roll(dem_i1, (-radius_cell - 1, radius_cell), axis=(0, 1))
+        - np.roll(dem_i1, (radius_cell, -radius_cell - 1), axis=(0, 1))
+    )
     # divide with nr of pixels inside kernel
-    with np.errstate(divide='ignore', invalid='ignore'):  # Suppress warning for dividing by zero
+    with np.errstate(
+        divide="ignore", invalid="ignore"
+    ):  # Suppress warning for dividing by zero
         dem_mean = dem_mean / kernel_nr_pix_arr
 
     # std
-    dem_std = (np.roll(dem_i2, (radius_cell, radius_cell), axis=(0, 1)) +
-               np.roll(dem_i2, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1)) -
-               np.roll(dem_i2, (-radius_cell - 1, radius_cell), axis=(0, 1)) -
-               np.roll(dem_i2, (radius_cell, -radius_cell - 1), axis=(0, 1)))
+    dem_std = (
+        np.roll(dem_i2, (radius_cell, radius_cell), axis=(0, 1))
+        + np.roll(dem_i2, (-radius_cell - 1, -radius_cell - 1), axis=(0, 1))
+        - np.roll(dem_i2, (-radius_cell - 1, radius_cell), axis=(0, 1))
+        - np.roll(dem_i2, (radius_cell, -radius_cell - 1), axis=(0, 1))
+    )
 
-    with np.errstate(divide='ignore', invalid='ignore'):  # Suppress warning for dividing by zero
-        dem_std = np.sqrt(np.abs(dem_std / kernel_nr_pix_arr - dem_mean ** 2))
+    with np.errstate(
+        divide="ignore", invalid="ignore"
+    ):  # Suppress warning for dividing by zero
+        dem_std = np.sqrt(np.abs(dem_std / kernel_nr_pix_arr - dem_mean**2))
         # returns nan values where division by zero happens
 
-    dev_out = (np.roll(dem, (-1, -1), axis=(0, 1)) - dem_mean) / (dem_std + 1e-6)  # add 1e-6 to prevent division with 0
+    dev_out = (np.roll(dem, (-1, -1), axis=(0, 1)) - dem_mean) / (
+        dem_std + 1e-6
+    )  # add 1e-6 to prevent division with 0
 
     return dev_out
 
@@ -1486,17 +1738,20 @@ def max_elevation_deviation(dem, minimum_radius, maximum_radius, step):
 
     # This outputs float64, which is by design. Change final array to float32 at the end of the function (at return)
     dem_i1 = integral_image(dem_pad)
-    dem_i2 = integral_image(dem_pad ** 2)
+    dem_i2 = integral_image(dem_pad**2)
 
     for kernel_radius in range(minimum_radius, maximum_radius + 1, step):
         dev = topographic_dev(dem_pad, dem_i_nr_pixels, dem_i1, dem_i2, kernel_radius)[
-              maximum_radius:-(maximum_radius + 1),
-              maximum_radius:-(maximum_radius + 1)]
+            maximum_radius : -(maximum_radius + 1),
+            maximum_radius : -(maximum_radius + 1),
+        ]
         if kernel_radius == minimum_radius:
             dev_max_out = dev
             rad_max_out = np.zeros_like(dev, dtype=np.float32) + kernel_radius
         else:
-            rad_max_out = np.where(np.abs(dev_max_out) >= np.abs(dev), rad_max_out, kernel_radius)
+            rad_max_out = np.where(
+                np.abs(dev_max_out) >= np.abs(dev), rad_max_out, kernel_radius
+            )
             dev_max_out = np.where(np.abs(dev_max_out) >= np.abs(dev), dev_max_out, dev)
     # rad_max_out, radius of DEV for maxDEV (for each pixel)
 
@@ -1507,14 +1762,15 @@ def max_elevation_deviation(dem, minimum_radius, maximum_radius, step):
     return dev_max_out.astype(np.float32)
 
 
-def mstp(dem,
-         local_scale=(3, 21, 2),
-         meso_scale=(23, 203, 18),
-         broad_scale=(223, 2023, 180),
-         lightness=1.2,
-         ve_factor=1,
-         no_data=None
-         ):
+def mstp(
+    dem: FloatArray,
+    local_scale=(3, 21, 2),
+    meso_scale=(23, 203, 18),
+    broad_scale=(223, 2023, 180),
+    lightness=1.2,
+    ve_factor=1,
+    no_data=None,
+):
     """
     Compute Multi-scale topographic position (MSTP).
 
@@ -1540,14 +1796,27 @@ def mstp(dem,
     msrm_out : numpy.ndarray
         3D numpy RGB result array of Multi-scale topographic position.
     """
-    if local_scale[0] > local_scale[1] or meso_scale[0] > meso_scale[1] or broad_scale[0] > broad_scale[1]:
-        raise Exception("rvt.visualization.mstp: local_scale, meso_scale, broad_scale min has to be smaller than max!")
-    if (local_scale[1] - local_scale[0] < local_scale[2]) or (meso_scale[1] - meso_scale[0] < meso_scale[2]) or \
-            (broad_scale[1] - broad_scale[0] < broad_scale[2]):
-        raise Exception("rvt.visualization.mstp: local_scale, meso_scale, broad_scale step has"
-                        " to be within min and max!")
+    if (
+        local_scale[0] > local_scale[1]
+        or meso_scale[0] > meso_scale[1]
+        or broad_scale[0] > broad_scale[1]
+    ):
+        raise Exception(
+            "rvt.visualization.mstp: local_scale, meso_scale, broad_scale min has to be smaller than max!"
+        )
+    if (
+        (local_scale[1] - local_scale[0] < local_scale[2])
+        or (meso_scale[1] - meso_scale[0] < meso_scale[2])
+        or (broad_scale[1] - broad_scale[0] < broad_scale[2])
+    ):
+        raise Exception(
+            "rvt.visualization.mstp: local_scale, meso_scale, broad_scale step has"
+            " to be within min and max!"
+        )
     if not (10000 >= ve_factor >= -1000):
-        raise Exception("rvt.visualization.mstp: ve_factor must be between -10000 and 10000!")
+        raise Exception(
+            "rvt.visualization.mstp: ve_factor must be between -10000 and 10000!"
+        )
 
     # change no_data to np.nan
     if no_data is not None:
@@ -1556,12 +1825,24 @@ def mstp(dem,
     dem = dem.astype(np.float32)
     dem = dem * ve_factor
 
-    local_dev = max_elevation_deviation(dem=dem, minimum_radius=local_scale[0], maximum_radius=local_scale[1],
-                                        step=local_scale[2])
-    meso_dev = max_elevation_deviation(dem=dem, minimum_radius=meso_scale[0], maximum_radius=meso_scale[1],
-                                       step=meso_scale[2])
-    broad_dev = max_elevation_deviation(dem=dem, minimum_radius=broad_scale[0], maximum_radius=broad_scale[1],
-                                        step=broad_scale[2])
+    local_dev = max_elevation_deviation(
+        dem=dem,
+        minimum_radius=local_scale[0],
+        maximum_radius=local_scale[1],
+        step=local_scale[2],
+    )
+    meso_dev = max_elevation_deviation(
+        dem=dem,
+        minimum_radius=meso_scale[0],
+        maximum_radius=meso_scale[1],
+        step=meso_scale[2],
+    )
+    broad_dev = max_elevation_deviation(
+        dem=dem,
+        minimum_radius=broad_scale[0],
+        maximum_radius=broad_scale[1],
+        step=broad_scale[2],
+    )
 
     cutoff = lightness
     # RGB order - broad, meso, local
@@ -1580,7 +1861,7 @@ def mstp(dem,
     return np.asarray([red, green, blue])  # RGB float32 (3 x 32bit)
 
 
-def fill_where_nan(dem, method="idw"):
+def fill_where_nan(dem: FloatArray, method="idw"):
     """
     Replaces np.nan values, with interpolation (extrapolation).
 
@@ -1605,7 +1886,9 @@ def fill_where_nan(dem, method="idw"):
 
     if method == "linear_row":
         # 1D row linear interpolation
-        dem_out[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), dem_out[~mask])
+        dem_out[mask] = np.interp(
+            np.flatnonzero(mask), np.flatnonzero(~mask), dem_out[~mask]
+        )
 
     elif method.split("_")[0] == "idw":
         radius = 20
@@ -1634,7 +1917,9 @@ def fill_where_nan(dem, method="idw"):
                 i_row_end = dem.shape[0]
             if i_column_end > dem.shape[1]:  # edge
                 i_column_end = dem.shape[0]
-            nan_surrounding_arr = dem[i_row_start:i_row_end, i_column_start:i_column_end]
+            nan_surrounding_arr = dem[
+                i_row_start:i_row_end, i_column_start:i_column_end
+            ]
             if np.all(np.isnan(nan_surrounding_arr)):  # whole surrounding array is nan
                 dem_out[i_row, i_column] = np.nan
             else:
@@ -1644,14 +1929,20 @@ def fill_where_nan(dem, method="idw"):
                 dist_arr[i_row_center, i_column_center] = 0
                 dist_arr = distance_transform_edt(dist_arr)
                 dist_arr[dist_arr == 0] = np.nan  # can't divide with zero
-                dist_arr = 1 / dist_arr ** power
+                dist_arr = 1 / dist_arr**power
                 nan_mask = np.isnan(nan_surrounding_arr)
                 dist_arr[nan_mask] = 0  # where nan weight matrix is zero
                 # calculate idw for one nan value
-                dem_out[i_row, i_column] = np.nansum(nan_surrounding_arr * dist_arr) / np.nansum(dist_arr)
+                dem_out[i_row, i_column] = np.nansum(
+                    nan_surrounding_arr * dist_arr
+                ) / np.nansum(dist_arr)
 
-    elif method == "kd_tree" or method == "nearest_neighbour" or method == "nearest_neighbor":
-        x, y = np.mgrid[0:dem_out.shape[0], 0:dem_out.shape[1]]
+    elif (
+        method == "kd_tree"
+        or method == "nearest_neighbour"
+        or method == "nearest_neighbor"
+    ):
+        x, y = np.mgrid[0 : dem_out.shape[0], 0 : dem_out.shape[1]]
         xy_good = np.array((x[~mask], y[~mask])).T
         xy_bad = np.array((x[mask], y[mask])).T
 
@@ -1659,11 +1950,13 @@ def fill_where_nan(dem, method="idw"):
         # https://stackoverflow.com/questions/3662361/fill-in-missing-values-with-nearest-neighbour-in-python-numpy-masked-arrays
         if method == "kd_tree":
             leaf_size = 1000
-            dem_out[mask] = dem_out[~mask][cKDTree(data=xy_good, leafsize=leaf_size).query(xy_bad)[1]]
+            dem_out[mask] = dem_out[~mask][
+                cKDTree(data=xy_good, leafsize=leaf_size).query(xy_bad)[1]
+            ]
 
         # Nearest neighbour interpolation
         elif method == "nearest_neighbour" or method == "nearest_neighbor":
-            dem_out[mask] = griddata(xy_good, dem_out[~mask], xy_bad, method='nearest')
+            dem_out[mask] = griddata(xy_good, dem_out[~mask], xy_bad, method="nearest")
 
     else:
         raise Exception("rvt.visualization.fill_where_nan: Wrong method!")
