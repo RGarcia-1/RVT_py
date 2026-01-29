@@ -37,9 +37,8 @@ def byte_scale(
     data: FloatArray,
     c_min: float | None = None,
     c_max: float | None = None,
-    high: int = 255,
-    low: int = 0,
     no_data: float | None = None,
+    dst_nodata: float = 255,
 ) -> UInt8Array:
     """
     Remade old scipy function.
@@ -56,79 +55,65 @@ def byte_scale(
         Scalar, Bias scaling of small values. Default is ``data.min()``.
     c_max : float | None
         Scalar, Bias scaling of large values. Default is ``data.max()``.
-    high : int
-        Scalar, Scale max value to `high`.  Default is 255.
-    low : int
-        Scalar, Scale min value to `low`.  Default is 0.
     no_data : float | None
         Value that represents no_data, it is changed to np.nan .
+    dst_nodata : float
+        The output destination NODATA (this should be either 0 or 255)
 
     Returns
     -------
     img_array : UInt8Array
-        The byte-scaled array.
+        The byte-scaled array. Pixels with NaN values are converted to 255
     """
-    is_2d_arr = False
-    data_bands = data
-    if len(data.shape) == 2:
-        is_2d_arr = True
-        data_bands = np.array([data])
+    if not (0 <= dst_nodata <= 255):
+        emsg = f"`dst_nodata` (={dst_nodata}) must range from 0 to 255"
+        raise ValueError(emsg)
+    if dst_nodata not in (0, 255):
+        emsg = "`dst_nodata` must either be 0 or 255"
+        raise ValueError(emsg)
 
-    c_min_orig = c_min
-    c_max_orig = c_max
+    # Reserve nodata code by scaling into the other 255 values
+    low, high = (1, 255) if dst_nodata == 0 else (0, 254)
 
-    byte_data_bands = []
-    for i_band in data_bands:
-        data = i_band
-        c_min = c_min_orig
-        c_max = c_max_orig
-        if high < low:
-            raise ValueError("`high` should be larger than `low`.")
+    arr = np.asarray(data)
+    ndims = arr.ndim
+    if ndims == 2:
+        arr = arr[None, ...]
+    elif ndims < 2:
+        emsg = "`data` must be 2D (nrows, ncols) or 3D (bands, nrows, ncols)"
+        raise ValueError(emsg)
 
-        if no_data is not None:  # change no data to np.nan
-            data[data == no_data] = np.nan
+    out_bands: list[UInt8Array] = []
+    # for i_band in data:
+    for i in range(arr.shape[0]):
+        band = np.array(arr[i, ...], dtype="float32", copy=True)
 
-        if c_min is None:
-            c_min = np.nanmin(data)
-        if c_max is None:
-            c_max = np.nanmax(data)
+        if (no_data is not None) and (not np.isnan(no_data)):
+            band[band == no_data] = np.nan
 
-        c_scale = c_max - c_min
-        if c_scale < 0:
-            raise ValueError("`cmax` should be larger than `cmin`.")
-        elif c_scale == 0:
-            c_scale = 1
+        # Handle all-NaN / no finite pixels
+        if not np.isfinite(band).any():
+            out_bands.append(np.full(band.shape, dst_nodata, dtype=np.uint8))
+            continue
 
-        if data.dtype == np.uint8:
-            # TODO: the following line seems not good to  me - if cmin=0, then that pixel will get negative value
-            byte_data = (
-                (high + 1) * (data - c_min - 1) / (c_max - c_min)
-            )  # copied from IDL BYTSCL
-            byte_data[byte_data > high] = high
-            byte_data[byte_data < 0] = 0
-            byte_data[np.isnan(byte_data)] = 0  # change no_data to 0
-            return np.asarray(byte_data, dtype=np.uint8) + np.asarray(
-                low, dtype=np.uint8
-            )
+        vmin = float(np.nanmin(band)) if c_min is None else c_min
+        vmax = float(np.nanmax(band)) if c_max is None else c_max
 
-        # scale = float(high - low) / cscale  # old scipy fn
-        # byte_data = (data * 1.0 - cmin) * scale + 0.4999  # old scipy fn
+        if vmax <= vmin:
+            emsg = f"`vmax` (={vmax}) should be larger than `vmin` (={vmin})"
+            raise ValueError(emsg)
 
-        byte_data = (
-            (high + 0.9999) * (data - c_min) / (c_max - c_min)
-        )  # copied from IDL BYTSCL
-        byte_data[byte_data > high] = high
-        byte_data[byte_data < 0] = 0
-        byte_data[np.isnan(byte_data)] = 255  # change no_data to 255
-        byte_data = np.asarray(byte_data, dtype=np.uint8) + np.asarray(
-            low, dtype=np.uint8
-        )
-        byte_data_bands.append(byte_data)
+        # copied from IDL BYTSCL
+        m = (high - low) / (vmax - vmin)
+        byte_scale = m * (band - vmin) + low
+        byte_scale = np.clip(byte_scale, low, high)
+        byte_scale[np.isnan(band)] = dst_nodata
+        out_bands.append(np.rint(byte_scale).astype("uint8"))
 
-    if is_2d_arr:  # if only one band
-        return byte_data_bands[0]
+    if ndims == 2:  # if only one band
+        return out_bands[0]
     else:  # multiple bands
-        return np.array(byte_data_bands)
+        return np.array(out_bands, order="C", dtype="uint8")
 
 
 def slope_percent(dzdx: FloatArray, dzdy: FloatArray) -> FloatArray:
