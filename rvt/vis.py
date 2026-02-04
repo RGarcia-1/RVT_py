@@ -25,9 +25,8 @@ import numexpr as ne
 import numpy as np
 import numpy.typing as npt
 from scipy.interpolate import griddata, RectBivariateSpline
-from scipy.ndimage.morphology import distance_transform_edt
+from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
-
 
 type FloatArray = npt.NDArray[np.floating]
 type UInt8Array = npt.NDArray[np.uint8]
@@ -140,9 +139,9 @@ def compute_dzdx_dzdy(
     pad: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute the spatial derivatives (dzdx and dzdy) from the DEM"""
-    dem_pad = np.pad(array=dem, pad_width=pad, mode="edge") * ve_factor
 
     nrows, ncols = dem.shape
+    dem_pad = np.pad(array=dem, pad_width=pad, mode="edge") * ve_factor
 
     dzdx = np.empty((nrows, ncols), dtype=np.float32)
     dzdy = np.empty((nrows, ncols), dtype=np.float32)
@@ -245,6 +244,9 @@ def slope_aspect(
 
     nan_dem = np.isnan(dem)  # store NaN mask
 
+    # NOTE: `dem` is padded inside `compute_dzdx_dzdy`, but the interior
+    #       portion is returned. Thus `dzdx` and `dzdy` have the same shape
+    #       as the input (unpadded) `dem`
     dzdx, dzdy = compute_dzdx_dzdy(
         dem=dem, res_x=resolution_x, res_y=resolution_y, ve_factor=ve_factor, pad=1
     )
@@ -341,20 +343,31 @@ def hillshade(
         raise Exception(emsg.format("`sun_elevation` must range between [0-90]"))
     if resolution_x < 0 or resolution_y < 0:
         raise Exception(emsg.format("resolution must be a positive number"))
+    if slope is not None and (dem.shape != slope.shape):
+        raise ValueError(
+            emsg.format("mismatch in image dimensions between `dem` and `slope`")
+        )
+    if aspect is not None and (dem.shape != aspect.shape):
+        raise ValueError(
+            emsg.format("mismatch in image dimensions between `dem` and `aspect`")
+        )
+
+
+    # Convert solar position (degrees) to radians
+    sun_azimuth_rad = np.deg2rad(sun_azimuth)
+    # Convert to solar zenith angle
+    sun_zenith_rad = 0.5 * np.pi - np.deg2rad(sun_elevation)
 
     # recast to float32 before changing `no_data` to np.nan
     dem = dem.astype("float32")
     if (no_data is not None) and (not np.isnan(no_data)):
         dem[dem == no_data] = np.nan
 
-    # add 1 pixel edge padding
-    dem = np.pad(array=dem, pad_width=1, mode="edge") * ve_factor
-
     # are slope and aspect already calculated and presented
     if slope is None or aspect is None:
         # calculates slope and aspect
         dict_slp_asp = slope_aspect(
-            dem=dem,
+            dem=dem * ve_factor,  # dem is padded inside `slope_aspect`
             resolution_x=resolution_x,
             resolution_y=resolution_y,
             output_units="radian",
@@ -363,10 +376,6 @@ def hillshade(
         aspect = dict_slp_asp["aspect"]
         del dict_slp_asp
 
-    # Convert solar position (degrees) to radians
-    sun_azimuth_rad = np.deg2rad(sun_azimuth)
-    # Convert to solar zenith angle
-    sun_zenith_rad = 0.5 * np.pi - np.deg2rad(sun_elevation)
     # Compute solar incidence angle, hillshading using numexpr
     hillshade_out = ne.evaluate(
         "cos(sun_zenith_rad) * cos(slope) "
@@ -374,8 +383,7 @@ def hillshade(
     )
     hillshade_out[hillshade_out < 0] = 0  # set all negative to 0
 
-    # return interior (unpadded) hillshade image
-    return hillshade_out[1:-1, 1:-1]
+    return hillshade_out
 
 
 def multi_hillshade(
@@ -420,15 +428,24 @@ def multi_hillshade(
     """
     emsg = "rvt.visualization.multi_hillshade: {0}"
     if dem.ndim != 2:
-        raise Exception(emsg.format("dem has to be 2D np.ndarray"))
+        raise ValueError(emsg.format("dem has to be 2D np.ndarray"))
     if sun_elevation > 90 or sun_elevation < 0:
-        raise Exception(emsg.format("`sun_elevation` must be between [0-90]"))
+        raise ValueError(emsg.format("`sun_elevation` must be between [0-90]"))
     if resolution_x < 0 or resolution_y < 0:
-        raise Exception(emsg.format("resolution must be a positive number"))
+        raise ValueError(emsg.format("resolution must be a positive number"))
     if nr_directions < 1:
-        raise Exception(emsg.format("`nr_directions` must be a positive number"))
+        raise ValueError(emsg.format("`nr_directions` must be a positive number"))
     if not (10000 >= ve_factor >= -10000):
-        raise Exception(emsg.format("`ve_factor` must be between [-10000, 10000]"))
+        raise ValueError(emsg.format("`ve_factor` must be between [-10000, 10000]"))
+    if slope is not None and (dem.shape != slope.shape):
+        raise ValueError(
+            emsg.format("mismatch in image dimensions between `dem` and `slope`")
+        )
+    if aspect is not None and (dem.shape != aspect.shape):
+        raise ValueError(
+            emsg.format("mismatch in image dimensions between `dem` and `aspect`")
+        )
+
 
     # recast to float32 before changing `no_data` to np.nan
     dem = dem.astype(np.float32)

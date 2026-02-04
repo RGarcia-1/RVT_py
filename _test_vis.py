@@ -1,11 +1,14 @@
 # rvt.vis quick TEST
 # test files: https://www.dropbox.com/sh/p7ia8fk6mywa8y3/AABWuw4wFUvULU7SeNXyWhjka?dl=0
 
+from pathlib import Path
 import time
 import rasterio as rio
 import rvt.vis
 import numpy as np
 
+
+TEST_PATH = Path(__file__).parent / "test_data"
 
 def test_slope_aspect(input_dem_path, output_path, ve_factor=1, output_units="degree"):
     input_dem_dataset = rio.open(input_dem_path)
